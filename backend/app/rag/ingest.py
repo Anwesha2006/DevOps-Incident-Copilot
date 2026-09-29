@@ -3,10 +3,16 @@ from pathlib import Path
 from pypdf import PdfReader
 import json
 import numpy as np
+import psycopg
+from pgvector.psycopg import register_vector
 from dotenv import load_dotenv
+import os
 load_dotenv()
 BASE_DIR = Path(__file__).resolve().parents[2]
 DOCUMENTS_DIR = BASE_DIR / "data" / "incidents"
+DATABASE_URL=os.getenv("DATABASE_URL","postgresql://postgres:postgres@localhost:5432/incident_copilot")
+model=SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
 def extract_text_from_pdf(pdf_path):
     reader=PdfReader(pdf_path)
     pages=[]
@@ -24,6 +30,7 @@ def load_documents():
     for pdf_path in DOCUMENTS_DIR.glob("*.pdf"):
         pages=extract_text_from_pdf(pdf_path)
         documents.extend(pages)
+    return documents
 def chunk_text(text,chunk_size=100,overlap=10):
     chunks=[]
     start=0
@@ -34,7 +41,42 @@ def chunk_text(text,chunk_size=100,overlap=10):
         chunks.append(chunk)
         start+=chunk_size-overlap
     return chunks
-model=SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+def get_connection():
+    conn = psycopg.connect(DATABASE_URL)
+    register_vector(conn)
+    return conn
+def create_table(conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE EXTENSION IF NOT EXISTS vector;
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS document_chunks (
+                id SERIAL PRIMARY KEY,
+                text TEXT NOT NULL,
+                source TEXT NOT NULL,
+                page INTEGER,
+                embedding VECTOR(384)
+            );
+        """)
+    conn.commit()
+def store_chunks(conn, chunks, embeddings):
+    with conn.cursor() as cur:
+        for chunk, embedding in zip(chunks, embeddings):
+            cur.execute(
+                """
+                INSERT INTO document_chunks
+                (text, source, page, embedding)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (
+                    chunk["text"],
+                    chunk["source"],
+                    chunk["page"],
+                    embedding
+                )
+            )
+    conn.commit()
 if __name__ == "__main__":
     documents = load_documents()
     print("Loaded pages:", len(documents))
@@ -42,6 +84,8 @@ if __name__ == "__main__":
     for document in documents:
         document_chunks = chunk_text(
             document["text"],
+            chunk_size=100,
+            overlap=10
         )
         for chunk in document_chunks:
             chunks.append({
@@ -51,31 +95,20 @@ if __name__ == "__main__":
             })
     print("Created chunks:", len(chunks))
     texts = [chunk["text"] for chunk in chunks]
-    embeddings = model.encode(texts)
+    embeddings = model.encode(
+        texts,
+        show_progress_bar=True
+    )
     embeddings = np.array(embeddings).astype("float32")
     print("Embedding shape:", embeddings.shape)
-    dimension = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dimension)
-    index.add(embeddings)
-    print("Vectors stored:", index.ntotal)
-    # Create vector_store folder
-    vector_store = Path("vector_store")
-    vector_store.mkdir(exist_ok=True)
-    faiss.write_index(
-        index,
-        "vector_store/index.faiss"
+    conn = get_connection()
+    create_table(conn)
+    store_chunks(
+        conn,
+        chunks,
+        embeddings
     )
-    with open(
-        "vector_store/metadata.json",
-        "w",
-        encoding="utf-8"
-    ) as f:
-        json.dump(
-            chunks,
-            f,
-            indent=2
-        )
-    print("FAISS index saved!")
-    print("Metadata saved!")
-
+    print("Vectors stored in PostgreSQL!")
+    conn.close()
+    print("Ingestion complete!")
 
