@@ -32,7 +32,7 @@ def search_logs(service: str, query: str, time_range: str) -> list:
             continue
         if query.lower() in log["message"].lower():
             results.append(log)
-    return results
+    return json.dumps(results)
 
 @mcp.tool()
 def get_metrics(service: str, time_range: str) -> dict:
